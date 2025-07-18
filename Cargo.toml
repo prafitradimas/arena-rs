@@ -1,0 +1,10 @@
+[package]
+name = "arena-rs"
+version = "0.1.0"
+edition = "2024"
+description = "A simple memory arena implementation."
+
+[lib]
+name = "arena"
+
+[dependencies]
