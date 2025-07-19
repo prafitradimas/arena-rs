@@ -6,5 +6,12 @@ description = "A simple memory arena implementation."
 
 [lib]
 name = "arena"
+crate-type = ["rlib", "cdylib"]
 
 [dependencies]
+wasm-bindgen = { version = "0.2", optional = true }
+
+[features]
+default = []
+debug = []
+wasm = ["dep:wasm-bindgen"]

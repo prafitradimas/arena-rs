@@ -1,152 +1,318 @@
-//! # Example:
-//! ```rust
-//! use arena::Arena;
-//! use std::mem::{size_of};
-//!
-//! let mut arena = Arena::new(4096).expect("Should create a new arena");
-//! let items = arena.alloc(Vec::new()).expect("Should allocate a vector");
-//!
-//! for i in 0..5 {
-//!     items.push(i);
-//! }
-//!
-//! let s_len = {
-//!     let s = arena.alloc_str("test str").expect("Should allocate str");
-//!     assert_eq!(s, "test str");
-//!     s.len()
-//! };
-//! assert_eq!(arena.len(), size_of::<Vec<i32>>() + s_len);
-//! ```
-
 use std::{
-    alloc::{Layout, alloc, dealloc},
-    cell::UnsafeCell,
-    ptr::{NonNull, null_mut},
+    alloc::{Layout, LayoutError, alloc, dealloc},
+    cell::{Cell, UnsafeCell},
+    fmt::Display,
+    ptr::NonNull,
 };
 
+#[repr(C)]
 pub struct Arena {
-    inner: UnsafeCell<ArenaInner>,
-}
-
-struct ArenaInner {
-    data: NonNull<[u8]>,
-    offset: usize,
+    blocks: Vec<UnsafeCell<Block>>,
+    block_size: BlockSize,
 }
 
 impl Arena {
-    pub fn new(capacity: usize) -> Option<Self> {
-        let layout = Layout::from_size_align(capacity, align_of::<usize>()).ok()?;
+    pub fn new() -> Result<Self, ArenaError> {
+        let block_size = DEFAULT_BLOCK_SIZE;
+        Self::with_block_size(block_size)
+    }
 
-        let ptr = unsafe { alloc(layout) };
-        if ptr.is_null() {
-            return None;
-        }
+    pub fn with_block_size(size: usize) -> Result<Self, ArenaError> {
+        let block = Block::new(size)?;
 
-        let data = unsafe { std::slice::from_raw_parts_mut(ptr, capacity) };
-
-        Some(Self {
-            inner: ArenaInner {
-                data: NonNull::from(data),
-                offset: 0,
-            }
-            .into(),
+        Ok(Self {
+            blocks: vec![UnsafeCell::new(block)],
+            block_size: size,
         })
     }
 
-    #[inline(always)]
-    pub fn cap(&self) -> usize {
-        unsafe { (*self.inner.get()).cap() }
+    pub fn scope<Func, FuncResult>(&mut self, func: Func) -> FuncResult
+    where
+        Func: FnOnce(&mut Arena) -> FuncResult,
+    {
+        let snapshot = self.snapshot();
+        let result = func(self);
+        self.rewind_to(snapshot);
+
+        result
     }
 
-    #[inline(always)]
-    pub fn len(&self) -> usize {
-        unsafe { (*self.inner.get()).len() }
-    }
-
-    #[must_use]
-    #[inline(always)]
-    pub fn is_empty(&self) -> bool {
-        self.len() == 0
-    }
-
-    #[inline(always)]
-    pub fn reset(&mut self) {
-        self.inner.get_mut().offset = 0;
-    }
-
-    pub fn alloc<T: Sized>(&mut self, obj: T) -> Option<&mut T> {
+    #[inline]
+    pub fn alloc<T: Sized>(&mut self, obj: T) -> Result<&mut T, ArenaError> {
         let layout = Layout::new::<T>();
-        let inner = self.inner();
-        let ptr = inner.allocate(layout) as *mut T;
-
-        if ptr.is_null() {
-            return None;
-        }
-
+        let ptr = self.try_alloc(layout)? as *mut T;
         unsafe {
             std::ptr::write(ptr, obj);
-            Some(&mut *ptr)
+            Ok(&mut *ptr)
         }
     }
 
-    pub fn alloc_str(&mut self, s: &str) -> Option<&str> {
-        let layout = Layout::from_size_align(s.len(), align_of::<u8>()).ok()?;
-        let inner = self.inner();
-        let ptr = inner.allocate(layout);
-
-        if ptr.is_null() {
-            return None;
-        }
-
+    #[inline]
+    pub fn alloc_slice<T: Sized>(&mut self, length: usize) -> Result<&mut [T], ArenaError> {
+        let layout = Layout::array::<T>(length)?;
+        let ptr = self.try_alloc(layout)? as *mut T;
         unsafe {
-            std::ptr::copy_nonoverlapping(s.as_ptr(), ptr, s.len());
-            Some(std::str::from_utf8_unchecked_mut(
-                std::slice::from_raw_parts_mut(ptr, s.len()),
-            ))
+            std::ptr::write_bytes(ptr, 0, length);
+            Ok(&mut *std::ptr::slice_from_raw_parts_mut(ptr, length))
         }
     }
 
-    #[inline(always)]
-    fn inner(&mut self) -> &mut ArenaInner {
-        unsafe { &mut *self.inner.get() }
-    }
-}
-
-impl ArenaInner {
-    fn allocate(&mut self, layout: Layout) -> *mut u8 {
-        let align = layout.align();
-        let alloc_size = layout.size();
-
-        let arena_size = self.data.len();
-
-        let aligned_offset = (self.offset + align - 1) & !(align - 1);
-
-        if aligned_offset + alloc_size > arena_size {
-            return null_mut();
-        }
-
-        let ptr = unsafe { (self.data.as_ptr() as *mut u8).add(aligned_offset) };
-        self.offset = aligned_offset + alloc_size;
-        ptr
+    #[inline]
+    pub fn alloc_str(&mut self, str: &str) -> Result<&str, ArenaError> {
+        let copied = self.copy_slice(str.as_bytes())?;
+        let slice = unsafe { std::str::from_utf8_unchecked(copied) };
+        Ok(slice)
     }
 
-    #[inline(always)]
-    pub fn len(&self) -> usize {
-        self.offset
-    }
-
-    #[inline(always)]
-    pub fn cap(&self) -> usize {
-        self.data.len()
-    }
-}
-
-impl Drop for ArenaInner {
-    fn drop(&mut self) {
-        let layout = Layout::from_size_align(self.cap(), align_of::<usize>()).unwrap();
-
+    #[inline]
+    pub fn copy_slice<T: Copy>(&mut self, slice: &[T]) -> Result<&mut [T], ArenaError> {
+        let layout = Layout::array::<T>(slice.len())?;
+        let ptr = self.try_alloc(layout)? as *mut T;
         unsafe {
-            dealloc(self.data.as_ptr() as *mut u8, layout);
+            std::ptr::copy_nonoverlapping(slice.as_ptr(), ptr, slice.len());
+            Ok(&mut *std::ptr::slice_from_raw_parts_mut(ptr, slice.len()))
+        }
+    }
+
+    #[inline]
+    pub fn reset(&mut self) {
+        for block in &mut self.blocks {
+            block.get_mut().reset();
+        }
+    }
+
+    #[inline]
+    pub fn reset_zeroed(&mut self) {
+        for block in &mut self.blocks {
+            block.get_mut().reset_zeroed();
+        }
+    }
+
+    #[inline]
+    fn try_alloc(&mut self, layout: Layout) -> Result<*mut u8, ArenaError> {
+        let block = match self.try_get_block(layout) {
+            Some(block) => block,
+            None => self.alloc_new_block(layout.size())?,
         };
+        block.alloc(layout)
+    }
+
+    #[inline]
+    fn alloc_new_block(&mut self, size: BlockSize) -> Result<&mut Block, ArenaError> {
+        let block = Block::new(self.block_size.max(size))?;
+
+        self.blocks.push(UnsafeCell::new(block));
+        Ok(self.blocks.last_mut().unwrap().get_mut())
+    }
+
+    #[inline]
+    fn try_get_block(&mut self, layout: Layout) -> Option<&mut Block> {
+        for block in &mut self.blocks {
+            let deref_block = block.get_mut();
+            if deref_block.remaining() > layout.size() {
+                return Some(deref_block);
+            }
+        }
+        None
+    }
+
+    pub fn snapshot(&self) -> ArenaSnapshot {
+        let block_idx = self.blocks.len() - 1;
+        let block = unsafe { &*self.blocks[block_idx].get() };
+        let offset = block.curr_ptr.get();
+
+        ArenaSnapshot { block_idx, offset }
+    }
+
+    #[inline]
+    pub fn rewind_to(&mut self, snapshot: ArenaSnapshot) {
+        if let Some(block) = self.blocks.get_mut(snapshot.block_idx) {
+            let block = block.get_mut();
+            block.rewind_to(snapshot.offset);
+        }
+
+        for block in self.blocks.iter_mut().skip(snapshot.block_idx + 1) {
+            block.get_mut().reset();
+        }
+    }
+
+    #[cfg(feature = "debug")]
+    pub fn dump(&self) {
+        println!("Arena Debug Dump");
+        println!("================");
+        println!("Total blocks: {}", self.blocks.len());
+
+        for (i, block) in self.blocks.iter().enumerate() {
+            unsafe { &*block.get() }.dump(i);
+        }
+
+        println!();
+    }
+}
+
+#[must_use]
+pub struct ArenaSnapshot {
+    block_idx: usize,
+
+    /// block's save point
+    offset: *mut u8,
+}
+
+type BlockPtr = NonNull<u8>;
+type BlockSize = usize;
+type BlockCursor = Cell<*mut u8>;
+
+const DEFAULT_BLOCK_SIZE: BlockSize = 64 * 1024;
+
+#[repr(C)]
+struct Block {
+    start_ptr: BlockPtr,
+    end_ptr: BlockPtr,
+    curr_ptr: BlockCursor,
+    size: BlockSize,
+}
+
+impl Block {
+    pub fn new(size: BlockSize) -> Result<Self, ArenaError> {
+        if size == 0 {
+            return Err(ArenaError::ZeroSize);
+        }
+
+        let alignment = align_of::<usize>();
+        let layout = Layout::from_size_align(size, alignment)?;
+
+        unsafe {
+            let ptr = alloc(layout);
+            if ptr.is_null() {
+                Err(ArenaError::InsufficientMemory)
+            } else {
+                let start_ptr = NonNull::new_unchecked(ptr);
+
+                Ok(Self {
+                    start_ptr,
+                    end_ptr: start_ptr.add(size),
+                    curr_ptr: BlockCursor::new(ptr),
+                    size,
+                })
+            }
+        }
+    }
+
+    pub fn alloc(&self, layout: Layout) -> Result<*mut u8, ArenaError> {
+        let size = layout.size();
+        let alignment = layout.align();
+
+        let old_ptr = self.curr_ptr.get();
+
+        let align_mask = !(alignment - 1);
+        let aligned = ((old_ptr as usize + alignment - 1) & align_mask) as *mut u8;
+
+        let new_ptr = unsafe { aligned.add(size) };
+        if new_ptr > self.end_ptr.as_ptr() {
+            return Err(ArenaError::InsufficientMemory);
+        }
+
+        self.curr_ptr.set(new_ptr);
+        Ok(aligned)
+    }
+
+    #[inline]
+    pub fn rewind_to(&mut self, save_point: *mut u8) {
+        self.curr_ptr.set(save_point);
+    }
+
+    #[inline]
+    pub fn reset(&mut self) {
+        self.curr_ptr.set(self.start_ptr.as_ptr());
+    }
+
+    #[inline]
+    pub fn reset_zeroed(&mut self) {
+        self.reset();
+        unsafe { std::ptr::write_bytes(self.start_ptr.as_ptr(), 0, self.size) };
+    }
+
+    #[inline]
+    pub fn remaining(&self) -> BlockSize {
+        (self.end_ptr.as_ptr() as usize) - (self.curr_ptr.as_ptr() as usize)
+    }
+
+    #[cfg(test)]
+    pub fn as_ptr(&self) -> *mut u8 {
+        self.start_ptr.as_ptr()
+    }
+
+    #[cfg(feature = "debug")]
+    pub fn dump(&self, index: usize) {
+        let start = self.start_ptr.as_ptr() as usize;
+        let end = self.end_ptr.as_ptr() as usize;
+        let curr = self.curr_ptr.get() as usize;
+
+        println!(
+            "  Block[{index}]: size = {:>6} bytes | used = {:>6} bytes | remaining = {:>6} bytes",
+            self.size,
+            curr - start,
+            end - curr
+        );
+        println!("    start = 0x{start:x}, curr = 0x{curr:x}, end = 0x{end:x}");
+    }
+}
+
+impl Drop for Block {
+    fn drop(&mut self) {
+        unsafe {
+            let layout = Layout::from_size_align_unchecked(self.size, align_of::<u8>());
+            dealloc(self.start_ptr.as_ptr(), layout);
+        }
+    }
+}
+
+#[derive(Debug)]
+#[must_use]
+pub enum ArenaError {
+    /// Zero-size blocks are invalid
+    ZeroSize,
+
+    /// Block alignment must be power of two
+    BadAlignment,
+
+    /// OOM, couldn't allocate block
+    InsufficientMemory,
+}
+
+impl Display for ArenaError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ArenaError::BadAlignment => {
+                f.write_str("Size should be non-zero and must be power of two.")
+            }
+            ArenaError::InsufficientMemory => f.write_str("Out of Memory."),
+            ArenaError::ZeroSize => write!(f, "Cannot allocate block of size zero"),
+        }
+    }
+}
+
+impl From<LayoutError> for ArenaError {
+    fn from(_: LayoutError) -> Self {
+        ArenaError::BadAlignment
+    }
+}
+
+impl std::error::Error for ArenaError {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_should_have_low_bits_eq_0() {
+        let size = 32;
+        let mask = size - 1;
+
+        let block = Block::new(size).unwrap();
+
+        // the block address bitwise AND the alignment bits (size - 1) should
+        // be a mutually exclusive set of bits
+        assert!((block.as_ptr() as usize & mask) ^ mask == mask);
     }
 }

@@ -1,22 +1,19 @@
+#[allow(unused_imports)]
 use arena::Arena;
 
+#[cfg(feature = "debug")]
 pub fn main() {
-    let mut arena = Arena::new(4096).expect("Should construct a new arena");
+    let mut arena = Arena::new().expect("Should construct a new arena");
 
-    let items: &mut Vec<i32> = arena
-        .alloc(Vec::<i32>::new())
-        .expect("Should allocate vector");
+    arena.alloc_str("wtf");
 
-    for i in 0..5 {
-        items.push(i);
-    }
-
-    let s_len = {
+    {
         let s: &str = arena.alloc_str("test str").expect("Should allocate str");
         println!("Arena: {s} len: {}", s.len());
-        s.len()
     };
 
-    assert_eq!(arena.len(), size_of::<Vec<i32>>() + s_len);
-    println!("Arena: using {} of {} bytes", arena.len(), arena.cap());
+    arena.dump();
 }
+
+#[cfg(not(any(feature = "debug", feature = "wasm")))]
+pub fn main() {}
